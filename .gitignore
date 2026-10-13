@@ -1,0 +1,32 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+models/
+*.log
+dist/
+
+# Local issue notes and conversations are kept off the public repository.
+.scratch/
+
+# User settings, recordings, and runtime data copied into the checkout.
+.cache/
+.config/
+.local/
+/config.json
+/recordings/
+/output/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Local build and test artifacts.
+build/
+*.egg-info/
+.coverage
+htmlcov/
+core
+core.[0-9]*

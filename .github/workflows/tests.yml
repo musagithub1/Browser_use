@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Ubuntu desktop bindings
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            python3-gi python3-venv gir1.2-gtk-3.0 gir1.2-atspi-2.0 \
+            at-spi2-core dbus-x11 xvfb xauth alsa-utils
+
+      - name: Install Python dependencies
+        run: |
+          /usr/bin/python3 -m venv --system-site-packages .venv
+          .venv/bin/python -m pip install -r requirements.txt
+
+      - name: Run regression tests
+        run: dbus-run-session -- xvfb-run -a ./scripts/test.sh
