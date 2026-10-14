@@ -10,7 +10,7 @@ gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi
 
 from jev_linux.desktop import DesktopError
-from jev_linux.note_editor import refresh_note_steps
+from jev_linux.note_editor import refresh_note_steps, verify_note_visible_steps
 from jev_linux.notes import read_note
 
 
@@ -355,6 +355,115 @@ class NoteEditorTests(unittest.TestCase):
             self.complete(steps)
         self.assertEqual(self.button.actions, 0)
         self.assertEqual(self.discard.actions, 1)
+
+
+class NoteVisibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.path = self.root / "Visible brief.md"
+        self.path.write_text("# Visible brief\nVerified contents.\n")
+        self.snapshot = read_note(self.path, self.root)
+        self.body = Node(role="text", text=self.snapshot["content"])
+        self.filename = Node(self.path.name, attrs={"file-uri": self.path.as_uri()})
+        self.button = Node("Discard Changes and Reload", "push button", action=lambda: None)
+        self.window = Node("Text Editor", "frame", [self.filename, self.body, self.button])
+        self.app = Node("gnome-text-editor", "application", [self.window],
+                        attrs={"application-id": "org.gnome.TextEditor"})
+        self.desktop = Node("Desktop", "desktop frame", [self.app])
+
+    def steps(self, clock=None):
+        options = {"desktop": self.desktop}
+        if clock is not None:
+            options["clock"] = clock
+        return verify_note_visible_steps(str(self.path), self.snapshot, self.root, **options)
+
+    def complete(self, steps=None):
+        steps = steps or self.steps()
+        for _ in range(100):
+            try:
+                next(steps)
+            except StopIteration as result:
+                return result.value
+        self.fail("Visible note verification did not settle")
+
+    def test_exact_native_body_and_current_disk_are_verified_without_actions(self):
+        self.assertIs(self.complete(), True)
+        self.assertEqual(self.button.actions, 0)
+
+    def test_waits_cooperatively_for_opened_note_body_without_reloading(self):
+        self.body.text = "An older buffer"
+        steps = self.steps()
+        self.assertEqual(next(steps), .05)
+        self.assertEqual(self.button.actions, 0)
+        self.body.text = self.snapshot["content"]
+        self.assertIs(self.complete(steps), True)
+        self.assertEqual(self.button.actions, 0)
+
+    def test_missing_native_document_times_out_without_changing_any_control(self):
+        self.app.attrs["application-id"] = "another.editor"
+        self.app.get_process_id = lambda: 0
+        now = iter(range(10))
+        with self.assertRaisesRegex(DesktopError, "not visible"):
+            self.complete(self.steps(clock=lambda: next(now)))
+        self.assertEqual(self.button.actions, 0)
+
+    def test_duplicate_matching_documents_are_not_visibility_evidence(self):
+        self.app.children.append(Node("Other window", "frame", [
+            Node(self.path.name), Node(role="text", text=self.snapshot["content"])]))
+        with self.assertRaisesRegex(DesktopError, "More than one"):
+            self.complete()
+        self.assertEqual(self.button.actions, 0)
+
+    def test_pending_confirmation_is_not_accepted_or_activated(self):
+        discard = Node("Discard", "push button", action=lambda: None)
+        self.window.children.append(Node(f"Discard Changes to “{self.path.name}”?", "alert", [discard]))
+        with self.assertRaisesRegex(DesktopError, "dialog"):
+            self.complete()
+        self.assertEqual(discard.actions, 0)
+        self.assertEqual(self.button.actions, 0)
+
+    def test_wrong_file_association_and_unsaved_changes_are_rejected(self):
+        self.filename.attrs["file-uri"] = (self.root / "Other.md").as_uri()
+        with self.assertRaisesRegex(DesktopError, "association"):
+            self.complete()
+        self.filename.attrs["file-uri"] = self.path.as_uri()
+        self.filename.attrs["modified"] = "true"
+        with self.assertRaisesRegex(DesktopError, "unsaved"):
+            self.complete()
+        self.assertEqual(self.button.actions, 0)
+
+    def test_disk_change_while_waiting_invalidates_visibility_evidence(self):
+        self.body.showing = False
+        steps = self.steps()
+        self.assertEqual(next(steps), .05)
+        self.path.write_text("Changed by another writer\n")
+        self.body.showing = True
+        with self.assertRaisesRegex(DesktopError, "changed again"):
+            self.complete(steps)
+        self.assertEqual(self.button.actions, 0)
+
+    def test_incomplete_or_inconsistent_snapshot_is_rejected(self):
+        self.snapshot["truncated"] = True
+        with self.assertRaisesRegex(DesktopError, "Full saved-note"):
+            self.complete()
+        self.snapshot["truncated"] = False
+        self.snapshot["content"] += "Unverified content"
+        with self.assertRaisesRegex(DesktopError, "Full saved-note"):
+            self.complete()
+
+    def test_transient_native_tree_read_is_retried_without_an_action(self):
+        original = self.body.get_child_count
+        pending = {"once": True}
+        def count():
+            if pending["once"]:
+                pending["once"] = False
+                return -1
+            return original()
+        self.body.get_child_count = count
+        self.assertIs(self.complete(), True)
+        self.assertEqual(self.button.actions, 0)
 
 
 if __name__ == "__main__":

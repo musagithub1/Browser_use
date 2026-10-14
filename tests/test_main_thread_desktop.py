@@ -83,6 +83,27 @@ class ResumableNoteBackend(NativeBackend):
             self.note("refresh_finished")
 
 
+class ResumableVisibleNoteBackend(NativeBackend):
+    def __init__(self):
+        super().__init__()
+        self.visible = False
+        self.arguments = None
+
+    def verify_note_visible(self, *args):
+        raise AssertionError("The GTK adapter must drive resumable visible-note verification.")
+
+    def verify_note_visible_steps(self, path, snapshot, notes_directory):
+        self.arguments = (path, snapshot, notes_directory)
+        try:
+            self.note("read_visible_note")
+            while not self.visible:
+                yield .05
+            self.note("visible_note_verified")
+            return True
+        finally:
+            self.note("visible_verification_finished")
+
+
 class MainThreadDesktopTests(unittest.TestCase):
     def setUp(self):
         self.native = NativeBackend()
@@ -367,6 +388,68 @@ class MainThreadDesktopTests(unittest.TestCase):
         with self.assertRaises(DesktopDispatchError):
             self.proxy.refresh_note("note.md", {}, {}, "notes")
         self.assertEqual(native.calls, [])
+
+    def test_visible_note_verification_yields_to_owner_loop_and_forwards_evidence(self):
+        native = ResumableVisibleNoteBackend()
+        resume_delays = []
+
+        def schedule_after(delay, callback):
+            resume_delays.append(delay)
+            self.scheduled.put(callback)
+
+        self.proxy = MainThreadDesktopBackend(native, schedule=self.scheduled.put,
+                                              schedule_after=schedule_after)
+        self.addCleanup(self.proxy.close)
+        snapshot = {"path": "note.md", "content": "Saved content"}
+        thread, outcome = self.worker(lambda: self.proxy.verify_note_visible(
+            "note.md", snapshot, "notes"))
+        self.dispatch()
+
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(native.arguments, ("note.md", snapshot, "notes"))
+        self.assertEqual(resume_delays, [.05])
+        self.assertEqual(native.calls, [("read_visible_note", threading.get_ident())])
+
+        # GTK can finish mapping the editor during the cooperative wait.
+        native.visible = True
+        self.dispatch()
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIs(outcome["result"], True)
+        self.assertEqual(native.calls, [(name, threading.get_ident()) for name in
+                                      ("read_visible_note", "visible_note_verified",
+                                       "visible_verification_finished")])
+
+    def test_revoked_visible_note_guard_prevents_next_read_and_closes_on_owner(self):
+        native = ResumableVisibleNoteBackend()
+        self.proxy = MainThreadDesktopBackend(native, schedule=self.scheduled.put)
+        self.addCleanup(self.proxy.close)
+        current = {"valid": True}
+        thread, outcome = self.worker(lambda: self.proxy.run_guarded(
+            "verify_note_visible", ("note.md", {}, "notes"), {},
+            lambda: current["valid"]))
+        self.dispatch()
+        current["valid"] = False
+        native.visible = True
+        self.dispatch()
+        thread.join(1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(outcome["error"], DesktopDispatchError)
+        self.assertEqual(native.calls, [("read_visible_note", threading.get_ident()),
+                                       ("visible_verification_finished", threading.get_ident())])
+        self.assertTrue(self.scheduled.empty())
+
+    def test_owner_cannot_start_blocking_visible_note_verification(self):
+        native = ResumableVisibleNoteBackend()
+        self.proxy = MainThreadDesktopBackend(native, schedule=self.scheduled.put)
+        self.addCleanup(self.proxy.close)
+        with self.assertRaises(DesktopDispatchError):
+            self.proxy.verify_note_visible("note.md", {}, "notes")
+
+        self.assertEqual(native.calls, [])
+        self.assertTrue(self.scheduled.empty())
 
 
 if __name__ == "__main__":

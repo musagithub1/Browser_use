@@ -746,9 +746,11 @@ class Controller(TaskRunner):
         from gi.repository import Gio
         editor = Gio.DesktopAppInfo.new("org.gnome.TextEditor.desktop")
         if editor:
-            editor.launch([Gio.File.new_for_path(str(path))], None)
+            opened = editor.launch([Gio.File.new_for_path(str(path))], None)
         else:
-            Gio.AppInfo.launch_default_for_uri(path.as_uri(), None)
+            opened = Gio.AppInfo.launch_default_for_uri(path.as_uri(), None)
+        if not opened:
+            raise RuntimeError("The editor did not accept opening the saved note.")
 
     def _note_refresh_evidence(self, utterance, path):
         """Pair a current-task append with its complete, revision-linked read."""
@@ -829,10 +831,13 @@ class Controller(TaskRunner):
             self._persist_task(utterance)
         self.emit("action", message)
 
+        return record
+
     def _execute(self, utterance, operation, args, fingerprint, expected_version=None):
         if not self._current(utterance) or (expected_version is not None and utterance.version != expected_version):
             return
         version = utterance.version
+        native_note_visibility = None
         def perform(method, *parameters, **options):
             if hasattr(self.backend, "run_guarded"):
                 return self.backend.run_guarded(method, parameters, options,
@@ -887,6 +892,9 @@ class Controller(TaskRunner):
         elif operation == "open_note":
             path = self._validated_note(args["note_path"])
             evidence = self._note_refresh_evidence(utterance, path) if hasattr(self.backend, "refresh_note") else None
+            snapshot = evidence[1] if evidence is not None else (
+                read_note(path, self.config["notes_directory"], max_chars=1000000)
+                if hasattr(self.backend, "verify_note_visible") else None)
             self._open_note(path)
             message = f"Opened saved note: {path}"
             if evidence is not None:
@@ -894,6 +902,14 @@ class Controller(TaskRunner):
                 if perform("refresh_note", str(path), before, after, self.config["notes_directory"]) is not True:
                     raise RuntimeError("The saved append is preserved, but the editor's updated text was not verified.")
                 message = f"Opened saved note and verified updated text in Text Editor: {path}"
+            elif snapshot is not None:
+                if perform("verify_note_visible", str(path), snapshot, self.config["notes_directory"]) is not True:
+                    raise RuntimeError("The saved note's visible content could not be verified in Text Editor.")
+                message = f"Opened saved note and verified visible content in Text Editor: {path}"
+            if snapshot is not None:
+                native_note_visibility = {"path": str(path), "revision": snapshot["revision"],
+                                          "editor": "Text Editor", "content_visible": True,
+                                          "saved_body_matches": True, "source": "native accessibility"}
         elif operation == "read_note":
             data = read_note(args["note_path"], self.config["notes_directory"])
             utterance.task_data.append({"source": "note", **data})
@@ -952,8 +968,11 @@ class Controller(TaskRunner):
             self._open_note(path.resolve())
             message = f"Saved and opened note: {path}"
             utterance.completed[-1]["result"] = message
+            utterance.completed[-1]["effect_receipt"] = {"saved": True, "editor_open_request_succeeded": True}
             self.emit("action", message)
             return
         else:
             raise RuntimeError("Unsupported operation.")
-        self._record_action(utterance, operation, args, fingerprint, message)
+        record = self._record_action(utterance, operation, args, fingerprint, message)
+        if native_note_visibility is not None and isinstance(record, dict):
+            record["native_note_visibility"] = native_note_visibility

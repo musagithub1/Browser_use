@@ -844,6 +844,33 @@ class DesktopBackend:
         finally:
             steps.close()
 
+    def verify_note_visible_steps(self, path, snapshot, notes_directory):
+        """Check a saved note's full native body without changing editor state."""
+        from .note_editor import verify_note_visible_steps
+        steps = verify_note_visible_steps(path, snapshot, notes_directory)
+        try:
+            while True:
+                with self._lock:
+                    try:
+                        delay = next(steps)
+                    except StopIteration as complete:
+                        return complete.value
+                yield delay
+        finally:
+            steps.close()
+
+    def verify_note_visible(self, path, snapshot, notes_directory):
+        steps = self.verify_note_visible_steps(path, snapshot, notes_directory)
+        try:
+            while True:
+                try:
+                    delay = next(steps)
+                except StopIteration as complete:
+                    return complete.value
+                time.sleep(delay)
+        finally:
+            steps.close()
+
     def refresh_note_steps(self, path, before, after, notes_directory):
         """Reload only an unchanged note buffer backed by a verified append."""
         from .note_editor import refresh_note_steps

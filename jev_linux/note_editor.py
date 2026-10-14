@@ -214,6 +214,41 @@ def _activate_button(button, label):
         raise DesktopError("Text Editor rejected the native reload action.")
 
 
+def verify_note_visible_steps(path, snapshot, notes_directory, *, desktop=None,
+                              clock=time.monotonic):
+    """Read-only proof that this exact saved note is visible in Text Editor.
+
+    Opening a file can return before GTK exposes its document. Yield while
+    waiting so the dispatcher can process native events and revoke its lease.
+    No focus, reload, or confirmation action is performed by this check.
+    """
+    path = Path(path)
+    if (snapshot.get("truncated") is not False or snapshot.get("path") != str(path)
+            or not isinstance(snapshot.get("content"), str)
+            or snapshot.get("revision") != hashlib.sha256(snapshot["content"].encode("utf-8")).hexdigest()):
+        raise DesktopError("Full saved-note evidence is required to verify its visible editor content.")
+    _disk_matches(path, snapshot, notes_directory)
+    desktop = desktop if desktop is not None else Atspi.get_desktop(0)
+    deadline = clock() + 3
+    while True:
+        _disk_matches(path, snapshot, notes_directory)
+        try:
+            document = _document(desktop, path)
+            if document is not None:
+                if document.alerts:
+                    raise DesktopError("A Text Editor dialog is open; resolve it manually before verifying the note.")
+                if _same_buffer(_body_text(document), snapshot["content"]):
+                    _disk_matches(path, snapshot, notes_directory)
+                    return True
+        except (NoteEditorTreePending, GLib.Error):
+            # Native children may be replaced after opening. Only incomplete
+            # reads retry; ambiguity, dirty buffers and mismatched files fail.
+            pass
+        if clock() >= deadline:
+            raise DesktopError("The saved note's exact content is not visible in Text Editor yet; open it, then continue.")
+        yield .05
+
+
 def refresh_note_steps(path, before, after, notes_directory, *, desktop=None,
                        clock=time.monotonic):
     """Invoke the native reload once, only when discarding loses no user edits.

@@ -1,16 +1,20 @@
 """Exercise the real planned-task worker with local, deterministic adapters."""
 
 import copy
+import json
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import httpx
 
 from jev_linux.config import DEFAULTS
 from jev_linux.controller import Controller
 from jev_linux.planning import PlanStep, TaskPlan
+from jev_linux.provider import JevClient
 
 
 def eventually(predicate, timeout=6):
@@ -1045,6 +1049,277 @@ class PlannedTaskTests(unittest.TestCase):
         self.assertEqual(notes[0].read_text(), generated + "\n")
         self.assertEqual([effect["action"] for effect in controller._active.completed],
                          ["read_url", "create_note"])
+
+    def test_planned_read_retains_bare_spoken_url_when_instruction_refers_to_specified_url(self):
+        spoken_url = "docs.python.org/3/tutorial/introduction.html"
+        url = "https://" + spoken_url
+        step = PlanStep("read", "Read the Python tutorial introduction from the specified URL",
+                        f"The content of {spoken_url} has been read", allowed_actions=("read_url",))
+        client = FakeJev(lambda state: "done" if state["completed_steps"] else "read_url")
+        controller = self.start(FakePlanner([step]), client)
+        with patch.object(controller.web_reader, "read", return_value={"url": url, "content": "Python basics"}) as reader:
+            controller.submit(f"Read the Python tutorial introduction at {spoken_url}")
+            eventually(lambda: reader.called or controller._active.status in {"blocked", "failed"})
+            reader.assert_called_once_with(url)
+            self.completed()
+        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(controller._active.task_data, [{"source": "web", "url": url, "content": "Python basics"}])
+
+    def test_planned_read_does_not_offer_other_goal_urls_from_later_steps(self):
+        url = "https://docs.python.org/3/tutorial/introduction.html"
+        step = PlanStep("read", "Read the specified tutorial page",
+                        f"The content of {url} has been read", allowed_actions=("read_url",))
+        client = FakeJev(lambda state: "done" if state["completed_steps"] else "read_url")
+        controller = self.start(FakePlanner([step]), client)
+        with patch.object(controller.web_reader, "read", return_value={"url": url, "content": "Python basics"}) as reader:
+            controller.submit("Read docs.python.org/3/tutorial/introduction.html, then compare it with example.org/other-guide")
+            self.completed()
+        reader.assert_called_once_with(url)
+        self.assertTrue(client.calls)
+        for state in client.calls:
+            self.assertEqual(set(state["url_candidates"].values()), {url})
+
+    def test_planned_read_does_not_authorize_an_address_only_in_expected_outcome(self):
+        step = PlanStep("read", "Read the specified tutorial page",
+                        "The content of https://unrequested.example/page has been read", allowed_actions=("read_url",))
+        client = FakeJev(lambda state: "done" if state["completed_steps"] else "read_url")
+        controller = self.start(FakePlanner([step]), client)
+        with patch.object(controller.web_reader, "read") as reader:
+            controller.submit("Read docs.python.org/3/tutorial/introduction.html")
+            self.blocked()
+        reader.assert_not_called()
+        self.assertTrue(client.calls)
+        for state in client.calls:
+            self.assertEqual(state["url_candidates"], {})
+
+    def saved_note_verification_fixture(self, focused_score=.95, on_focused=None, with_source=False):
+        generated = ("# Beginner brief\n\n- Numbers hold values.\n- Strings hold text.\n- Lists hold items.\n"
+                     "- Variables name values.\n- Loops repeat work.\n\n1. Add two numbers.\n"
+                     "2. Name a string.\n3. Make a list.\n\nSource: https://example.org/guide")
+        instruction = ("Create a beginner brief with five bullet points, three numbered exercises, "
+                       "the source link https://example.org/guide, and fewer than 180 words. Save and open it in Text Editor.")
+        step = PlanStep("brief", instruction, "The requested brief is saved and opened in Text Editor",
+                        allowed_actions=("create_note",))
+        def choose(state):
+            reading = state["current_step"]["id"] == "read"
+            if state["completed_steps"]:
+                return {"action": "done", "step_complete": int(reading)}
+            return "read_url" if reading else {"action": "create_note", "text": "none", "text_mode": "generate"}
+        fixture = FakeJev(choose)
+        requests = []
+
+        def handle(request):
+            payload = json.loads(request.content)
+            requests.append(payload)
+            if request.url.path.endswith("/chat/completions"):
+                return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": generated}}]})
+            self.assertTrue(request.url.path.endswith("/decisions"))
+            state, questions = payload["state"], payload["questions"]
+            if set(questions) == {"step_complete"}:
+                artifact = state.get("saved_artifact", {})
+                receipt = state["completed_steps"][-1].get("effect_receipt", {})
+                valid = (artifact.get("content") == generated + "\n"
+                         and Path(artifact.get("path", "")).is_file()
+                         and receipt.get("saved") is True
+                         and receipt.get("editor_open_request_succeeded") is True)
+                if on_focused:
+                    on_focused()
+                answers = {"step_complete": {"type": "noul", "noul": focused_score if valid else 0}}
+            else:
+                answers = fixture.decide(state, questions)["answers"]
+                for name, answer in answers.items():
+                    answer["type"] = questions[name]["type"]
+                    if answer["type"] == "choice":
+                        answer["probabilities"] = {key: int(key == answer["choice"]) for key in questions[name]["criteria"]}
+            return httpx.Response(200, json={"answers": answers})
+
+        http = httpx.Client(transport=httpx.MockTransport(handle))
+        self.addCleanup(http.close)
+        client = JevClient({**DEFAULTS, "openrouter_api_key": "offline-fixture-key"}, client=http)
+        steps = [step]
+        if with_source:
+            steps.insert(0, PlanStep("read", "Read https://example.org/guide", "The source has been read",
+                                     allowed_actions=("read_url",)))
+            instruction = "Read https://example.org/guide and " + instruction
+        controller = self.start(FakePlanner(steps), client)
+        return controller, requests, instruction, generated
+
+    def test_uncertain_generated_note_completion_verifies_the_actual_saved_artifact(self):
+        controller, requests, instruction, generated = self.saved_note_verification_fixture()
+        with patch.object(controller, "_open_note") as opened:
+            controller.submit(instruction)
+            eventually(lambda: controller._active.status in {"completed", "blocked", "failed"})
+            self.assertEqual(controller._active.status, "completed")
+        opened.assert_called_once()
+        focused = [request for request in requests if set(request.get("questions", {})) == {"step_complete"}]
+        self.assertEqual(len(focused), 1)
+        state = focused[0]["state"]
+        self.assertEqual(state["saved_artifact"]["content"], generated + "\n")
+        self.assertFalse(set(state) & {"desktop", "installed_apps", "memory"})
+        self.assertNotIn("generate", state["completed_steps"][0]["arguments"])
+        self.assertEqual(len(list(Path(self.directory.name).glob("*.md"))), 1)
+
+    def test_low_focused_note_verification_keeps_the_saved_note_and_blocks(self):
+        controller, requests, instruction, generated = self.saved_note_verification_fixture(focused_score=.79)
+        with patch.object(controller, "_open_note") as opened:
+            controller.submit(instruction)
+            self.blocked()
+        opened.assert_called_once()
+        self.assertEqual(controller._active.step_index, 0)
+        notes = list(Path(self.directory.name).glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].read_text(), generated + "\n")
+        self.assertEqual(len([request for request in requests if set(request.get("questions", {})) == {"step_complete"}]), 1)
+        self.assertEqual(len([request for request in requests if "messages" in request]), 1)
+
+    def test_focused_note_verification_receives_the_actual_read_source(self):
+        controller, requests, instruction, _ = self.saved_note_verification_fixture(with_source=True)
+        source = {"url": "https://example.org/guide", "content": "Numbers hold values; strings hold text and lists hold items.", "truncated": False}
+        with patch.object(controller.web_reader, "read", return_value=source), patch.object(controller, "_open_note"):
+            controller.submit(instruction)
+            self.completed()
+        focused = [request for request in requests if set(request.get("questions", {})) == {"step_complete"}]
+        self.assertEqual(len(focused), 1)
+        self.assertEqual(focused[0]["state"]["task_data"], [{"source": "web", **source}])
+
+    def test_changed_saved_note_is_not_submitted_as_verified_generated_content(self):
+        controller, requests, instruction, _ = self.saved_note_verification_fixture()
+        with patch.object(controller, "_open_note", side_effect=lambda path: path.write_text("A later user edit\n")):
+            controller.submit(instruction)
+            self.blocked()
+        self.assertFalse([request for request in requests if set(request.get("questions", {})) == {"step_complete"}])
+        self.assertEqual(len(list(Path(self.directory.name).glob("*.md"))), 1)
+
+    def test_editor_open_failure_does_not_produce_a_successful_note_receipt(self):
+        controller, requests, instruction, _ = self.saved_note_verification_fixture()
+        with patch.object(controller, "_open_note", side_effect=RuntimeError("Editor could not open the note")):
+            controller.submit(instruction)
+            eventually(lambda: controller._active.status == "failed")
+        self.assertEqual(len(controller._active.completed), 1)
+        self.assertNotIn("effect_receipt", controller._active.completed[0])
+        self.assertFalse([request for request in requests if set(request.get("questions", {})) == {"step_complete"}])
+        self.assertFalse(any(event["message"] == "Done." for event in self.events))
+
+    def test_cancellation_during_focused_note_verification_cannot_complete_the_task(self):
+        controller, requests, instruction, _ = self.saved_note_verification_fixture(
+            on_focused=lambda: self.controller.cancel())
+        with patch.object(controller, "_open_note"):
+            controller.submit(instruction)
+            eventually(lambda: any(event["type"] == "task_progress" and event.get("status") == "cancelled"
+                                   for event in self.events))
+        self.assertIsNone(controller._active)
+        self.assertFalse(any(event["message"] == "Done." for event in self.events))
+        self.assertEqual(len(list(Path(self.directory.name).glob("*.md"))), 1)
+
+    def test_explicit_note_open_completion_receives_verified_native_file_visibility(self):
+        payload = "A saved study brief"
+        steps = [PlanStep("save", f'Create a note containing "{payload}"', "The note is saved",
+                          allowed_actions=("create_note",)),
+                 PlanStep("open", "Open that saved brief in Text Editor", "The saved brief is open and visible in Text Editor",
+                          allowed_actions=("open_note",))]
+        self.backend.verify_note_visible = Mock(return_value=True)
+
+        def choose(state):
+            if state["current_step"]["id"] == "save":
+                return "done" if state["completed_steps"] else {"action": "create_note", "text": next(
+                    key for key, value in state["text_candidates"].items() if value == payload)}
+            if state["completed_steps"]:
+                return {"action": "done", "step_complete": .95 if state.get("native_note_visibility") else .49}
+            return "open_note"
+
+        client = FakeJev(choose)
+        decide = client.decide
+        focused = []
+
+        def verify(state, questions):
+            if set(questions) == {"step_complete"}:
+                focused.append(copy.deepcopy(state))
+                return {"answers": {"step_complete": {"noul": .95}}}
+            result = decide(state, questions)
+            if state["current_step"]["id"] == "open" and state["completed_steps"]:
+                result["answers"]["step_complete"]["noul"] = .49
+            return result
+
+        client.decide = verify
+        controller = self.start(FakePlanner(steps), client)
+        with patch.object(controller, "_open_note") as opened:
+            controller.submit(f'Create a note containing "{payload}"; then open that saved brief in Text Editor.')
+            eventually(lambda: controller._active.status in {"completed", "blocked", "failed"})
+            self.assertEqual(controller._active.status, "completed")
+        self.assertEqual(opened.call_count, 2)
+        self.backend.verify_note_visible.assert_called_once()
+        notes = list(Path(self.directory.name).glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        proof = [state["native_note_visibility"] for state in client.calls
+                 if state["current_step"]["id"] == "open" and state["completed_steps"]]
+        self.assertTrue(proof)
+        self.assertEqual(proof[-1][0]["path"], str(notes[0].resolve()))
+        self.assertIs(proof[-1][0]["content_visible"], True)
+        self.assertEqual(len(focused), 1)
+        self.assertEqual(focused[0]["native_note_visibility"], proof[-1])
+
+    def test_direct_note_workflow_excludes_large_desktop_but_preserves_sources_and_exact_text(self):
+        payload, added = "Keep   this exact study text.", "Append   this exact next step."
+        source = {"url": "https://example.org/guide", "content": "A read source for the requested study note."}
+        self.backend.apps = lambda: [
+            {"id": f"app{i}.desktop", "name": f"Unrelated app {i}", "aliases": ["Unrelated alias " * 10]}
+            for i in range(68)] + [{"id": "chrome.desktop", "name": "Chrome", "browser": True}]
+        self.backend.snapshot = lambda: {"focused_app": "Unrelated app 0", "windows": [
+            {"title": "Unrelated window content " * 20} for _ in range(30)], "elements": [
+            {"id": f"e{i}", "app": "Unrelated app 0", "name": "Unrelated control " * 20,
+             "role": "text", "value": "Unrelated field content " * 20, "editable": True}
+            for i in range(130)]}
+        steps = [PlanStep("read", "Read https://example.org/guide", "The source is read", allowed_actions=("read_url",)),
+                 PlanStep("save", f'Create a note containing "{payload}"', "The exact note is saved", allowed_actions=("create_note",)),
+                 PlanStep("edit", f'Read that note, append "{added}", then reopen it', "The original note is extended and reopened",
+                          allowed_actions=("read_note", "append_note", "open_note"))]
+
+        def choose(state):
+            identifier, effects = state["current_step"]["id"], state["completed_steps"]
+            if identifier == "read":
+                return "done" if effects else "read_url"
+            if identifier == "save":
+                return "done" if effects else {"action": "create_note", "text": next(
+                    key for key, text in state["text_candidates"].items() if text == payload)}
+            actions = {effect["action"] for effect in effects}
+            if "read_note" not in actions:
+                return "read_note"
+            if "append_note" not in actions:
+                return {"action": "append_note", "text": next(
+                    key for key, text in state["text_candidates"].items() if text == added)}
+            return "done" if "open_note" in actions else "open_note"
+
+        client = FakeJev(choose)
+        decide = client.decide
+        checked = []
+
+        def direct_decide(state, questions):
+            self.assertEqual(state["desktop"]["windows"], [])
+            self.assertEqual(state["desktop"]["elements"], [])
+            self.assertEqual(state["installed_apps"], {})
+            self.assertFalse(set(questions) & {"app", "target", "browser", "key", "direction"})
+            identifier = state["current_step"]["id"]
+            if identifier in {"save", "edit"}:
+                self.assertTrue({"text", "text_mode"} <= set(questions))
+                self.assertIn(source["content"], [item["content"] for item in state["task_data"]])
+            if identifier == "edit":
+                self.assertIn("note", questions)
+                self.assertTrue(state["remembered_notes"])
+            if identifier == "read":
+                self.assertIn(source["url"], questions["url"]["criteria"].values())
+            checked.append(identifier)
+            return decide(state, questions)
+
+        client.decide = direct_decide
+        controller = self.start(FakePlanner(steps), client)
+        with patch.object(controller.web_reader, "read", return_value=source) as reader, patch.object(controller, "_open_note"):
+            controller.submit(f'Read https://example.org/guide; create a note containing "{payload}"; read it, append "{added}", and reopen it.')
+            self.completed()
+        reader.assert_called_once_with(source["url"])
+        self.assertEqual(set(checked), {"read", "save", "edit"})
+        notes = list(Path(self.directory.name).glob("*.md"))
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].read_text(), payload + "\n" + added + "\n")
 
 
 if __name__ == "__main__":

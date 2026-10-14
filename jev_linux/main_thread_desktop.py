@@ -39,7 +39,8 @@ class MainThreadDesktopBackend:
     """
 
     _EFFECTS = frozenset({"launch_app", "open_url", "click", "type_text", "press_key", "scroll", "refresh_note"})
-    _RESUMABLE = frozenset({"type_text", "refresh_note"})
+    _GUARDED = _EFFECTS | {"verify_note_visible"}
+    _RESUMABLE = frozenset({"type_text", "refresh_note", "verify_note_visible"})
 
     def __init__(self, backend, *, timeout_seconds: float = 30, schedule=None,
                  schedule_after=None):
@@ -168,7 +169,7 @@ class MainThreadDesktopBackend:
         return call.result
 
     def run_guarded(self, method: str, args=(), kwargs=None, guard=None):
-        if method not in self._EFFECTS:
+        if method not in self._GUARDED:
             raise ValueError("Only supported desktop actions can use a guarded dispatch.")
         return self._invoke(method, args, kwargs, guard)
 
@@ -198,6 +199,9 @@ class MainThreadDesktopBackend:
 
     def refresh_note(self, path, before, after, notes_directory):
         return self._invoke("refresh_note", (path, before, after, notes_directory))
+
+    def verify_note_visible(self, path, snapshot, notes_directory):
+        return self._invoke("verify_note_visible", (path, snapshot, notes_directory))
 
     def press_key(self, key, expected_focus=None):
         return self._invoke("press_key", (key,), {"expected_focus": expected_focus})
